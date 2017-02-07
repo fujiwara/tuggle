@@ -1,0 +1,16 @@
+version: '2'
+services:
+  server:
+    image: consul:latest
+    volumes:
+     - .:/opt/tuggle
+    command: "agent -server -bootstrap-expect 1 -bind 0.0.0.0"
+<% ENV['CLIENTS'].to_i.times do|n| %>    
+  client<%= n %>:
+    image: consul:latest
+    volumes:
+     - .:/opt/tuggle
+    links:
+     - server
+    command: "/opt/tuggle/goreman -basedir /opt/tuggle start"
+<% end %>

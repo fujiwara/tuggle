@@ -1,0 +1,2 @@
+consul: consul agent -data-dir /var/tmp/consul -client 0.0.0.0 -join server
+tuggle: /opt/tuggle/tuggle -data-dir /tmp
