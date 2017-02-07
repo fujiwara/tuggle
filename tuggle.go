@@ -8,11 +8,14 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"path"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -20,11 +23,12 @@ import (
 )
 
 var (
-	client    *api.Client
-	dataDir   = "./data"
-	Namespace = "tuggle"
-	Port      = 8080
-	fetcherCh = make(chan fetchRequest, 10)
+	client            *api.Client
+	dataDir           = "./data"
+	Namespace         = "tuggle"
+	Port              = 8080
+	MaxFetchMultiplex = 3
+	fetcherCh         = make(chan fetchRequest, 10)
 )
 
 const (
@@ -40,6 +44,20 @@ type Object struct {
 	CreatedAt   time.Time `json:"created_at"`
 }
 
+func md5Hex(b []byte) string {
+	h := md5.New()
+	h.Write(b)
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+func NewObject(name string) *Object {
+	return &Object{
+		ID:        md5Hex([]byte(name)),
+		Name:      name,
+		CreatedAt: time.Now(),
+	}
+}
+
 func init() {
 	var err error
 	client, err = api.NewClient(api.DefaultConfig())
@@ -48,8 +66,13 @@ func init() {
 	}
 }
 
+func init() {
+	rand.Seed(time.Now().UnixNano())
+}
+
 func main() {
 	go fileFetcher()
+	go eventWatcher()
 
 	flag.StringVar(&dataDir, "data-dir", dataDir, "data directory")
 	flag.IntVar(&Port, "port", Port, "listen port")
@@ -59,7 +82,7 @@ func main() {
 	m := mux.NewRouter()
 	m.HandleFunc("/", indexHandler).Methods("GET")
 	m.HandleFunc("/{name:[^/]+}", putHandler).Methods("PUT")
-	m.HandleFunc("/{name:[^/]+}", getHandler).Methods("GET", "HEAD")
+	m.HandleFunc("/{name:[^/]+}", fileHandler).Methods("GET", "HEAD", "DELETE")
 
 	log.Printf(
 		"starting tuggle data-dir:%s port:%d namespace:%s\n",
@@ -70,15 +93,12 @@ func main() {
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", Port), m))
 }
 
-func registerService(obj *Object) error {
+func manageService(obj *Object, register bool) error {
+	var mu sync.Mutex
+	mu.Lock()
+	defer mu.Unlock()
+
 	var tags []string
-
-	lock, err := client.LockKey(path.Join(Namespace, obj.ID+".lock"))
-	if err != nil {
-		return err
-	}
-	defer lock.Unlock()
-
 	sv, err := client.Agent().Services()
 	if err != nil {
 		return err
@@ -90,7 +110,9 @@ func registerService(obj *Object) error {
 			}
 		}
 	}
-	tags = append(tags, obj.ID)
+	if register {
+		tags = append(tags, obj.ID)
+	}
 
 	reg := &api.AgentServiceRegistration{
 		ID:   Namespace,
@@ -99,6 +121,80 @@ func registerService(obj *Object) error {
 		Port: Port,
 	}
 	return client.Agent().ServiceRegister(reg)
+}
+
+func registerService(obj *Object) error {
+	return manageService(obj, true)
+}
+
+func deregisterService(obj *Object) error {
+	return manageService(obj, false)
+}
+
+func eventWatcher() {
+	var lastIndex uint64
+	processedEvents := make(map[string]bool)
+WATCH:
+	for {
+		events, qm, err := client.Event().List(
+			Namespace, // eventName
+			&api.QueryOptions{
+				WaitIndex: lastIndex,
+				WaitTime:  time.Second * 10,
+			},
+		)
+		if err != nil {
+			log.Println(err)
+			time.Sleep(time.Second)
+			continue WATCH
+		}
+	EVENT:
+		for _, ev := range events {
+			if processedEvents[ev.ID] {
+				continue EVENT
+			}
+			processedEvents[ev.ID] = true
+			if lastIndex == 0 {
+				// at first time, ignore all stucked events
+				continue EVENT
+			}
+			err := processEvent(string(ev.Payload))
+			if err != nil {
+				log.Println(err)
+			}
+		}
+		lastIndex = qm.LastIndex
+	}
+}
+
+func processEvent(payload string) error {
+	p := strings.SplitN(payload, ":", 2)
+	if len(p) != 2 {
+		return fmt.Errorf("invalid payload %s", payload)
+	}
+	method := p[0]
+	name := p[1]
+	switch method {
+	case "PUT":
+		log.Println("fetching", name)
+		f, err := fetch(name)
+		if err != nil {
+			return err
+		}
+		f.Close()
+	case "DELETE":
+		log.Println("deleting", name)
+		obj := NewObject(name)
+		if err := deregisterService(obj); err != nil {
+			return err
+		}
+		if err := purgeFile(name); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("unknown payload %s", payload)
+	}
+	return nil
 }
 
 func storeObject(obj *Object) error {
@@ -115,40 +211,58 @@ func storeObject(obj *Object) error {
 	return nil
 }
 
-func md5Hex(b []byte) string {
-	h := md5.New()
-	h.Write(b)
-	return fmt.Sprintf("%x", h.Sum(nil))
+func purgeObject(obj *Object) error {
+	_, err := client.KV().Delete(
+		path.Join(Namespace, obj.Name),
+		nil,
+	)
+	return err
+}
+
+func purgeFile(name string) error {
+	return os.Remove(filepath.Join(dataDir, name))
 }
 
 func storeFile(name string, r io.ReadCloser) (*Object, error) {
 	defer r.Close()
+	i := rand.Int()
 	filename := filepath.Join(dataDir, name)
-	f, err := os.Create(filename)
+	tmp := filename + "." + strconv.Itoa(i)
+	f, err := os.Create(tmp)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 
-	obj := Object{
-		ID:        md5Hex([]byte(name)),
-		Name:      name,
-		CreatedAt: time.Now(),
-	}
+	obj := NewObject(name)
 
 	if n, err := io.Copy(f, r); err != nil {
 		return nil, err
 	} else {
 		obj.Size = n
 	}
-	return &obj, nil
+	if err := os.Rename(tmp, filename); err != nil {
+		return nil, err
+	}
+	return obj, nil
 }
 
 func putHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	name := vars["name"]
 
-	obj, err := storeFile(name, r.Body)
+	obj, err := loadObject(name)
+	if err != nil {
+		log.Println(err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if obj != nil {
+		http.Error(w, "exists", http.StatusMethodNotAllowed)
+		return
+	}
+
+	obj, err = storeFile(name, r.Body)
 	if err != nil {
 		log.Println(err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -173,13 +287,43 @@ func putHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ev := &api.UserEvent{
+		Name:    Namespace,
+		Payload: []byte("PUT:" + name),
+	}
+	eventID, _, err := client.Event().Fire(ev, nil)
+	if err != nil {
+		log.Println(err)
+	} else {
+		log.Printf("event PUT:%s fired ID:%s", name, eventID)
+	}
+
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusCreated)
 }
 
+func lockFetchMultiplex(key string) (*api.Semaphore, error) {
+	prefix := path.Join(Namespace+".lock", key)
+	sem, _ := client.SemaphoreOpts(&api.SemaphoreOptions{
+		Prefix:            prefix,
+		Limit:             MaxFetchMultiplex,
+		SemaphoreWaitTime: time.Second,
+		SemaphoreTryOnce:  true,
+	})
+	ch, err := sem.Acquire(nil)
+	if err != nil {
+		return nil, err
+	}
+	if ch == nil {
+		sem.Release()
+		return nil, nil
+	}
+	return sem, nil
+}
+
 func indexHandler(w http.ResponseWriter, r *http.Request) {
 	kv := client.KV()
-	kvps, _, err := kv.List(Namespace, nil)
+	kvps, _, err := kv.List(Namespace+"/", nil)
 	if err != nil {
 		log.Println(err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -249,65 +393,88 @@ func fileFetcher() {
 }
 
 func loadFileOrRemote(name string) (io.ReadCloser, error) {
-	log.Println("load", name, "from local")
 	f, err := loadFile(name)
-
-	if f != nil && err == nil {
+	if err == nil && f != nil {
 		log.Println("hit local file")
-		// hit local file
 		return f, nil
 	}
 
-	// lookup service catlog
-	catalogServices, _, err := client.Catalog().Service(
-		Namespace,            // service name
-		md5Hex([]byte(name)), // tag is md5 hex
-		&api.QueryOptions{
-			RequireConsistent: true,
-			Near:              "_agent",
-		},
-	)
-	if err != nil {
-		return nil, err
-	}
-	if len(catalogServices) == 0 {
-		return nil, errors.New("Not Found in this cluster")
-	}
+	tries := 10
+	for tries >= 0 {
+		tries--
+		// lookup service catlog
+		catalogServices, _, err := client.Catalog().Service(
+			Namespace,            // service name
+			md5Hex([]byte(name)), // tag is Object.ID
+			&api.QueryOptions{
+				RequireConsistent: true,
+				Near:              "_agent",
+			},
+		)
+		if err != nil {
+			log.Println(err)
+			continue
+		}
+		nodes := len(catalogServices)
+		if nodes == 0 {
+			return nil, errors.New("Not Found in this cluster")
+		}
 
-	for _, cs := range catalogServices {
-		u := fmt.Sprintf(
-			"http://%s:%d/%s",
-			cs.Address,
-			cs.ServicePort,
+		//pick up randomly from nearest 3 nodes
+		n := 3
+		if nodes < n {
+			n = nodes
+		}
+		cs := catalogServices[rand.Intn(n)]
+
+		sem, err := lockFetchMultiplex(cs.Address)
+		if err != nil || sem == nil {
+			log.Println("failed to get semaphore for", cs.Address)
+			continue
+		}
+
+		err = loadRemoteAndStore(
+			fmt.Sprintf("%s:%d", cs.Address, cs.ServicePort),
 			name,
 		)
-		log.Println("fetching from", u)
-		req, _ := http.NewRequest("GET", u, nil)
-		req.Header.Set(InternalHeader, "True")
-		resp, err := http.DefaultClient.Do(req)
+		sem.Release()
 		if err != nil {
 			log.Println(err)
 			continue
 		}
-		if resp.StatusCode != http.StatusOK {
-			continue
-		}
+		self, _ := client.Agent().NodeName()
+		log.Printf(`[dot] "%s" -> "%s";`, cs.Node, self)
 
-		obj, err := storeFile(name, resp.Body)
-		if err != nil {
-			log.Println(err)
-			continue
-		}
-		if err := registerService(obj); err != nil {
-			log.Println(err)
-			continue
-		}
 		return loadFile(name)
 	}
-	return nil, errors.New("Not found in tuggle cluster")
+	return nil, fmt.Errorf("failed to get %s in this cluster", name)
 }
 
-func getHandler(w http.ResponseWriter, r *http.Request) {
+func loadRemoteAndStore(addr, name string) error {
+	u := fmt.Sprintf("http://%s/%s", addr, name)
+	log.Printf("loading remote %s", u)
+	req, _ := http.NewRequest("GET", u, nil)
+	req.Header.Set(InternalHeader, "True")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return err
+	}
+
+	obj, err := storeFile(name, resp.Body)
+	if err != nil {
+		return err
+	}
+	if err := registerService(obj); err != nil {
+		return err
+	}
+	return nil
+}
+
+func fileHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	name := vars["name"]
 
@@ -321,12 +488,33 @@ func getHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Not Found", http.StatusNotFound)
 		return
 	}
+
+	if r.Method == http.MethodDelete {
+		err := purgeObject(obj)
+		if err != nil {
+			log.Println(err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+
+		ev := &api.UserEvent{
+			Name:    Namespace,
+			Payload: []byte("DELETE:" + obj.Name),
+		}
+		eventID, _, err := client.Event().Fire(ev, nil)
+		if err != nil {
+			log.Println(err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		log.Printf("event DELETE:%s fired ID:%s", obj.Name, eventID)
+		return
+	}
+
 	w.Header().Set("Content-Type", obj.ContentType)
+	w.Header().Set("Content-Length", strconv.FormatInt(obj.Size, 10))
 	w.Header().Set("Last-Modified", obj.CreatedAt.Format(time.RFC1123))
 	w.Header().Set("X-Tuggle-Object-ID", obj.ID)
 
 	if r.Method == http.MethodHead {
-		w.Header().Set("Content-Length", strconv.FormatInt(obj.Size, 10))
 		return
 	}
 
@@ -346,6 +534,5 @@ func getHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer f.Close()
 
-	w.Header().Set("Content-Length", strconv.FormatInt(obj.Size, 10))
 	io.Copy(w, f)
 }
