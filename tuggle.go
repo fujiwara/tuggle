@@ -26,7 +26,7 @@ var (
 	client            *api.Client
 	dataDir           = "./data"
 	Namespace         = "tuggle"
-	Port              = 8080
+	Port              = 8900
 	MaxFetchMultiplex = 3
 	fetcherCh         = make(chan fetchRequest, 10)
 )
