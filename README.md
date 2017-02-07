@@ -4,5 +4,6 @@ Distributed file mirroring proxy in Consul cluster
 
 ## LICENSE
 
-MIT License 
+MIT License
+
 Copyright (c) 2017 FUJIWARA Shunichiro / KAYAC Inc.
