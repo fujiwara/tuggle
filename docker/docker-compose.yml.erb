@@ -5,6 +5,9 @@ services:
     volumes:
      - .:/opt/tuggle
     command: "agent -server -bootstrap-expect 1 -bind 0.0.0.0"
+    ports:
+     - "8500:8500"
+
 <% ENV['CLIENTS'].to_i.times do|n| %>    
   client<%= n %>:
     image: consul:latest
@@ -13,4 +16,6 @@ services:
     links:
      - server
     command: "/opt/tuggle/goreman -basedir /opt/tuggle start"
+    ports:
+     - "<%= 8900+n %>:8900"
 <% end %>

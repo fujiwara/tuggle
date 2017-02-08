@@ -4,7 +4,7 @@ CLIENTS := 8
 
 all: tuggle goreman docker-compose.yml
 
-clean:
+clean: down
 	rm -f tuggle goreman docker-compose.yml
 
 tuggle: ../tuggle.go
