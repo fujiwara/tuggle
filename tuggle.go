@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"text/template"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -29,6 +30,25 @@ var (
 	Port              = 8900
 	MaxFetchMultiplex = 3
 	fetcherCh         = make(chan fetchRequest, 10)
+	graphTemplate     = `
+digraph "{{.Name}}" {
+  graph [
+    charset = "UTF-8",
+    label   = "{{.Name}}",
+    rankdir = LR
+  ];
+  node [
+    shape = box
+  ];
+{{range .Nodes}}
+  "{{.From}}" -> "{{.To}}" [
+    headlabel = "{{formatTime .End}}",
+    label     = "{{formatDuration .Elapsed}}"
+  ];
+{{end}}
+}
+`
+	graphTmpl *template.Template
 )
 
 const (
@@ -42,6 +62,25 @@ type Object struct {
 	ContentType string    `json:"content_type"`
 	Size        int64     `json:"size"`
 	CreatedAt   time.Time `json:"created_at"`
+}
+
+type Graph struct {
+	From    string        `json:"from"`
+	To      string        `json:"to"`
+	Start   time.Time     `json:"start"`
+	End     time.Time     `json:"end"`
+	Elapsed time.Duration `json:"elapsed"`
+}
+
+func NewGraph(from, to string, start time.Time) *Graph {
+	now := time.Now()
+	return &Graph{
+		From:    from,
+		To:      to,
+		Start:   start,
+		End:     now,
+		Elapsed: now.Sub(start),
+	}
 }
 
 func md5Hex(b []byte) string {
@@ -64,6 +103,19 @@ func init() {
 	if err != nil {
 		panic(err)
 	}
+
+	funcs := template.FuncMap{
+		"formatTime": func(t *time.Time) string {
+			return t.Format("15:04:05")
+		},
+		"formatDuration": func(d *time.Duration) string {
+			return fmt.Sprintf("%.2fs", d.Seconds())
+		},
+	}
+	graphTmpl, err = template.New("graph").Funcs(funcs).Parse(graphTemplate)
+	if err != nil {
+		panic(err)
+	}
 }
 
 func init() {
@@ -82,7 +134,8 @@ func main() {
 	m := mux.NewRouter()
 	m.HandleFunc("/", indexHandler).Methods("GET")
 	m.HandleFunc("/{name:[^/]+}", putHandler).Methods("PUT")
-	m.HandleFunc("/{name:[^/]+}", fileHandler).Methods("GET", "HEAD", "DELETE")
+	m.HandleFunc("/{name:[^/]+}", getHandler).Methods("GET", "HEAD")
+	m.HandleFunc("/{name:[^/]+}", deleteHandler).Methods("DELETE")
 
 	log.Printf(
 		"starting tuggle data-dir:%s port:%d namespace:%s\n",
@@ -197,17 +250,38 @@ func processEvent(payload string) error {
 	return nil
 }
 
+func recordGraph(name string, g *Graph) error {
+	kvp := &api.KVPair{
+		Key: path.Join(Namespace+".graph", name, g.From, g.To),
+	}
+	kvp.Value, _ = json.Marshal(g)
+
+	_, err := client.KV().Put(kvp, nil)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func deleteGraphTree(name string) error {
+	key := path.Join(Namespace+".graph", name)
+	_, err := client.KV().DeleteTree(key+"/", nil)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 func storeObject(obj *Object) error {
 	kvp := &api.KVPair{
 		Key: path.Join(Namespace, obj.Name),
 	}
 	kvp.Value, _ = json.Marshal(obj)
 
-	wm, err := client.KV().Put(kvp, nil)
+	_, err := client.KV().Put(kvp, nil)
 	if err != nil {
 		return err
 	}
-	log.Printf("%s metadata stored to consul kv in %s", obj.Name, wm.RequestTime)
 	return nil
 }
 
@@ -250,11 +324,6 @@ func storeFile(name string, r io.ReadCloser) (*Object, error) {
 func putHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	name := vars["name"]
-	silent := false
-	r.ParseForm()
-	if len(r.Form["silent"]) > 0 {
-		silent = true
-	}
 
 	obj, err := loadObject(name)
 	if err != nil {
@@ -292,7 +361,8 @@ func putHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !silent {
+	r.ParseForm() // parse must do after r.Body is read.
+	if len(r.Form["silent"]) == 0 {
 		ev := &api.UserEvent{
 			Name:    Namespace,
 			Payload: []byte("PUT:" + name),
@@ -434,12 +504,14 @@ func loadFileOrRemote(name string) (io.ReadCloser, error) {
 		}
 		cs := catalogServices[rand.Intn(n)]
 
+		start := time.Now()
+
 		sem, err := lockFetchMultiplex(cs.Address)
 		if err != nil || sem == nil {
 			log.Println("failed to get semaphore for", cs.Address)
+			time.Sleep(time.Second)
 			continue
 		}
-
 		err = loadRemoteAndStore(
 			fmt.Sprintf("%s:%d", cs.Address, cs.ServicePort),
 			name,
@@ -450,8 +522,13 @@ func loadFileOrRemote(name string) (io.ReadCloser, error) {
 			continue
 		}
 		self, _ := client.Agent().NodeName()
-		log.Printf(`[dot] "%s" -> "%s";`, cs.Node, self)
-
+		err = recordGraph(
+			name,
+			NewGraph(cs.Node, self, start),
+		)
+		if err != nil {
+			log.Println(err)
+		}
 		return loadFile(name)
 	}
 	return nil, fmt.Errorf("failed to get %s in this cluster", name)
@@ -481,9 +558,10 @@ func loadRemoteAndStore(addr, name string) error {
 	return nil
 }
 
-func fileHandler(w http.ResponseWriter, r *http.Request) {
+func getHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	name := vars["name"]
+	r.ParseForm()
 
 	obj, err := loadObject(name)
 	if err != nil {
@@ -496,23 +574,8 @@ func fileHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if r.Method == http.MethodDelete {
-		err := purgeObject(obj)
-		if err != nil {
-			log.Println(err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
-
-		ev := &api.UserEvent{
-			Name:    Namespace,
-			Payload: []byte("DELETE:" + obj.Name),
-		}
-		eventID, _, err := client.Event().Fire(ev, nil)
-		if err != nil {
-			log.Println(err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
-		log.Printf("event DELETE:%s fired ID:%s", obj.Name, eventID)
+	if len(r.Form["graph"]) > 0 {
+		graphHandler(w, r)
 		return
 	}
 
@@ -542,4 +605,75 @@ func fileHandler(w http.ResponseWriter, r *http.Request) {
 	defer f.Close()
 
 	io.Copy(w, f)
+}
+
+func graphHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	name := vars["name"]
+
+	kv := client.KV()
+	key := path.Join(Namespace+".graph", name)
+	kvps, _, err := kv.List(key+"/", nil)
+	if err != nil {
+		log.Println(err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	gs := make([]*Graph, 0, len(kvps))
+	for _, kvp := range kvps {
+		var g Graph
+		if err := json.Unmarshal(kvp.Value, &g); err != nil {
+			log.Println(err)
+			continue
+		}
+		gs = append(gs, &g)
+	}
+
+	w.Header().Set("Content-Type", "text/vnd.graphviz")
+	v := struct {
+		Name  string
+		Nodes []*Graph
+	}{
+		Name:  name,
+		Nodes: gs,
+	}
+	graphTmpl.Execute(w, v)
+}
+
+func deleteHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	name := vars["name"]
+
+	obj, err := loadObject(name)
+	if err != nil {
+		log.Println(err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if obj == nil {
+		http.Error(w, "Not Found", http.StatusNotFound)
+		return
+	}
+
+	if err := purgeObject(obj); err != nil {
+		log.Println(err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+
+	if err := deleteGraphTree(obj.Name); err != nil {
+		log.Println(err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+
+	ev := &api.UserEvent{
+		Name:    Namespace,
+		Payload: []byte("DELETE:" + obj.Name),
+	}
+	eventID, _, err := client.Event().Fire(ev, nil)
+	if err != nil {
+		log.Println(err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+	log.Printf("event DELETE:%s fired ID:%s", obj.Name, eventID)
+	return
 }
