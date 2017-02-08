@@ -250,6 +250,11 @@ func storeFile(name string, r io.ReadCloser) (*Object, error) {
 func putHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	name := vars["name"]
+	silent := false
+	r.ParseForm()
+	if len(r.Form["silent"]) > 0 {
+		silent = true
+	}
 
 	obj, err := loadObject(name)
 	if err != nil {
@@ -287,15 +292,17 @@ func putHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ev := &api.UserEvent{
-		Name:    Namespace,
-		Payload: []byte("PUT:" + name),
-	}
-	eventID, _, err := client.Event().Fire(ev, nil)
-	if err != nil {
-		log.Println(err)
-	} else {
-		log.Printf("event PUT:%s fired ID:%s", name, eventID)
+	if !silent {
+		ev := &api.UserEvent{
+			Name:    Namespace,
+			Payload: []byte("PUT:" + name),
+		}
+		eventID, _, err := client.Event().Fire(ev, nil)
+		if err != nil {
+			log.Println(err)
+		} else {
+			log.Printf("event PUT:%s fired ID:%s", name, eventID)
+		}
 	}
 
 	w.Header().Set("Content-Type", "text/plain")
