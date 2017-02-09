@@ -19,6 +19,8 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/dustin/go-humanize"
+	"github.com/fujiwara/shapeio"
 	"github.com/gorilla/mux"
 	"github.com/hashicorp/consul/api"
 )
@@ -29,6 +31,8 @@ var (
 	Namespace         = "tuggle"
 	Port              = 8900
 	MaxFetchMultiplex = 3
+	MaxFetchRate      float64
+	MaxFetchRetry     = 10
 	fetcherCh         = make(chan fetchRequest, 10)
 	graphTemplate     = `
 digraph "{{.Name}}" {
@@ -126,10 +130,21 @@ func main() {
 	go fileFetcher()
 	go eventWatcher()
 
+	var fetchRate string
 	flag.StringVar(&dataDir, "data-dir", dataDir, "data directory")
 	flag.IntVar(&Port, "port", Port, "listen port")
 	flag.StringVar(&Namespace, "namespace", Namespace, "namespace")
+	flag.StringVar(&fetchRate, "fetch-rate", "unlimited", "Max fetch rate limit(/sec)")
 	flag.Parse()
+
+	if fetchRate != "unlimited" {
+		if rate, err := humanize.ParseBytes(fetchRate); err != nil {
+			fmt.Println("Cannot parse -fetch-rate", err)
+			os.Exit(1)
+		} else {
+			MaxFetchRate = float64(rate)
+		}
+	}
 
 	m := mux.NewRouter()
 	m.HandleFunc("/", indexHandler).Methods("GET")
@@ -138,10 +153,11 @@ func main() {
 	m.HandleFunc("/{name:[^/]+}", deleteHandler).Methods("DELETE")
 
 	log.Printf(
-		"starting tuggle data-dir:%s port:%d namespace:%s\n",
+		"starting tuggle data-dir:%s port:%d namespace:%s fetch-rate:%s/sec",
 		dataDir,
 		Port,
 		Namespace,
+		fetchRate,
 	)
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", Port), m))
 }
@@ -476,9 +492,7 @@ func loadFileOrRemote(name string) (io.ReadCloser, error) {
 		return f, nil
 	}
 
-	tries := 10
-	for tries >= 0 {
-		tries--
+	for i := 0; i < MaxFetchRetry; i++ {
 		// lookup service catlog
 		catalogServices, _, err := client.Catalog().Service(
 			Namespace,            // service name
@@ -504,14 +518,18 @@ func loadFileOrRemote(name string) (io.ReadCloser, error) {
 		}
 		cs := catalogServices[rand.Intn(n)]
 
-		start := time.Now()
-
 		sem, err := lockFetchMultiplex(cs.Address)
 		if err != nil || sem == nil {
-			log.Println("failed to get semaphore for", cs.Address)
-			time.Sleep(time.Second)
+			delay := time.Duration(i+1) * time.Second
+			log.Printf(
+				"failed to get semaphore for %s waiting %s",
+				cs.Address,
+				delay,
+			)
+			time.Sleep(delay)
 			continue
 		}
+		start := time.Now()
 		err = loadRemoteAndStore(
 			fmt.Sprintf("%s:%d", cs.Address, cs.ServicePort),
 			name,
@@ -534,6 +552,23 @@ func loadFileOrRemote(name string) (io.ReadCloser, error) {
 	return nil, fmt.Errorf("failed to get %s in this cluster", name)
 }
 
+type LimitedReader struct {
+	*shapeio.Reader
+	src io.ReadCloser
+}
+
+func (r *LimitedReader) Close() error {
+	return r.src.Close()
+}
+
+func NewLimitedReader(src io.ReadCloser, limit float64) *LimitedReader {
+	reader := shapeio.NewReader(src)
+	if limit != 0 {
+		reader.SetRateLimit(limit)
+	}
+	return &LimitedReader{reader, src}
+}
+
 func loadRemoteAndStore(addr, name string) error {
 	u := fmt.Sprintf("http://%s/%s", addr, name)
 	log.Printf("loading remote %s", u)
@@ -548,7 +583,8 @@ func loadRemoteAndStore(addr, name string) error {
 		return err
 	}
 
-	obj, err := storeFile(name, resp.Body)
+	reader := NewLimitedReader(resp.Body, MaxFetchRate)
+	obj, err := storeFile(name, reader)
 	if err != nil {
 		return err
 	}
