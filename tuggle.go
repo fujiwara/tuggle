@@ -156,7 +156,7 @@ func main() {
 	flag.StringVar(&fetchRate, "fetch-rate", "unlimited", "Max fetch rate limit(/sec)")
 	flag.Parse()
 
-	if fetchRate != "unlimited" {
+	if fetchRate != "unlimited" && fetchRate != "" {
 		if rate, err := humanize.ParseBytes(fetchRate); err != nil {
 			fmt.Println("Cannot parse -fetch-rate", err)
 			os.Exit(1)
@@ -260,8 +260,7 @@ func processEvent(payload string) error {
 	if len(p) != 2 {
 		return fmt.Errorf("invalid payload %s", payload)
 	}
-	method := p[0]
-	name := p[1]
+	method, name := p[0], p[1]
 	switch method {
 	case "PUT":
 		log.Println("fetching", name)
@@ -593,6 +592,9 @@ func loadRemoteAndStore(addr, name string) error {
 	log.Printf("loading remote %s", u)
 	req, _ := http.NewRequest("GET", u, nil)
 	req.Header.Set(InternalHeader, "True")
+
+	start := time.Now()
+
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
@@ -607,6 +609,13 @@ func loadRemoteAndStore(addr, name string) error {
 	if err != nil {
 		return err
 	}
+	elapsed := time.Since(start)
+	log.Printf("%s fetched %s bytes in %.2f sec (%s/sec)",
+		name,
+		humanize.Comma(obj.Size),
+		elapsed.Seconds(),
+		humanize.Bytes(uint64(float64(obj.Size)/elapsed.Seconds())),
+	)
 	if err := registerService(obj); err != nil {
 		return err
 	}
