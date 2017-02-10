@@ -1,0 +1,16 @@
+{
+    "dependencies": {
+        "github.com/dustin/go-humanize": {
+            "branch": "master"
+        },
+        "github.com/fujiwara/shapeio": {
+            "branch": "master"
+        },
+        "github.com/gorilla/mux": {
+            "branch": "master"
+        },
+        "github.com/hashicorp/consul": {
+            "branch": "master"
+        }
+    }
+}

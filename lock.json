@@ -1,0 +1,77 @@
+{
+    "memo": "bff1f74cbd05bbaad99327511d1be594a874e16946f9e90de634b27af5f29a3c",
+    "projects": [
+        {
+            "name": "github.com/dustin/go-humanize",
+            "branch": "master",
+            "revision": "7a41df006ff9af79a29f0ffa9c5f21fbe6314a2d",
+            "packages": [
+                "."
+            ]
+        },
+        {
+            "name": "github.com/fujiwara/shapeio",
+            "branch": "master",
+            "revision": "3a70334bb0701dce9abd39c13299279d2444c93f",
+            "packages": [
+                "."
+            ]
+        },
+        {
+            "name": "github.com/gorilla/context",
+            "branch": "master",
+            "revision": "08b5f424b9271eedf6f9f0ce86cb9396ed337a42",
+            "packages": [
+                "."
+            ]
+        },
+        {
+            "name": "github.com/gorilla/mux",
+            "branch": "master",
+            "revision": "0a192a193177452756c362c20087ddafcf6829c4",
+            "packages": [
+                "."
+            ]
+        },
+        {
+            "name": "github.com/hashicorp/consul",
+            "branch": "master",
+            "revision": "f228812746f270ffbd3bf10e861219f4b2ce1187",
+            "packages": [
+                "api"
+            ]
+        },
+        {
+            "name": "github.com/hashicorp/go-cleanhttp",
+            "branch": "master",
+            "revision": "ad28ea4487f05916463e2423a55166280e8254b5",
+            "packages": [
+                "."
+            ]
+        },
+        {
+            "name": "github.com/hashicorp/serf",
+            "branch": "master",
+            "revision": "a72c0453da2ba628a013e98bf323a76be4aa1443",
+            "packages": [
+                "coordinate"
+            ]
+        },
+        {
+            "name": "golang.org/x/net",
+            "branch": "master",
+            "revision": "f2499483f923065a842d38eb4c7f1927e6fc6e6d",
+            "packages": [
+                "context"
+            ]
+        },
+        {
+            "name": "golang.org/x/time",
+            "branch": "master",
+            "revision": "f51c12702a4d776e4c1fa9b0fabab841babae631",
+            "packages": [
+                "rate"
+            ]
+        }
+    ]
+}
