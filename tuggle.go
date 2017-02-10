@@ -9,8 +9,10 @@ import (
 	"io"
 	"log"
 	"math/rand"
+	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"sort"
@@ -27,6 +29,7 @@ import (
 )
 
 var (
+	mu                sync.Mutex
 	client            *api.Client
 	dataDir           = "./data"
 	Namespace         = "tuggle"
@@ -182,7 +185,6 @@ func main() {
 }
 
 func manageService(obj *Object, register bool) error {
-	var mu sync.Mutex
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -693,8 +695,6 @@ func graphHandler(w http.ResponseWriter, r *http.Request) {
 		gs = append(gs, &g)
 	}
 	sort.Sort(gs)
-
-	w.Header().Set("Content-Type", "text/vnd.graphviz")
 	v := struct {
 		Name  string
 		Nodes []*Graph
@@ -702,7 +702,36 @@ func graphHandler(w http.ResponseWriter, r *http.Request) {
 		Name:  name,
 		Nodes: gs,
 	}
-	graphTmpl.Execute(w, v)
+
+	var contentType string
+	format := r.FormValue("format")
+	switch format {
+	case "png", "gif", "svg", "svgx":
+		contentType = mime.TypeByExtension("." + format)
+	default:
+		contentType = "text/vnd.graphviz"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.WriteHeader(http.StatusOK)
+
+	if contentType != "text/vnd.graphviz" {
+		cmd := exec.Command("dot", "-T"+format)
+		cmd.Stderr = os.Stderr
+		cmd.Stdout = w
+		p, _ := cmd.StdinPipe()
+		if err := cmd.Start(); err != nil {
+			log.Println(err)
+			return
+		}
+		graphTmpl.Execute(p, v)
+		p.Close()
+		if err := cmd.Wait(); err != nil {
+			log.Println(err)
+			return
+		}
+	} else {
+		graphTmpl.Execute(w, v)
+	}
 }
 
 func deleteHandler(w http.ResponseWriter, r *http.Request) {
