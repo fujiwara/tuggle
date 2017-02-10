@@ -1,4 +1,5 @@
 CLIENTS := 8
+RATE := ""
 
 .PHONY: clean up down all
 
@@ -14,7 +15,7 @@ goreman:
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build github.com/mattn/goreman
 
 docker-compose.yml: docker-compose.yml.erb
-	CLIENTS=$(CLIENTS) erb docker-compose.yml.erb > docker-compose.yml
+	CLIENTS=$(CLIENTS) RATE=$(RATE) erb docker-compose.yml.erb > docker-compose.yml
 
 up: all
 	docker-compose up

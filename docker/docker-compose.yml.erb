@@ -18,4 +18,6 @@ services:
     command: "/opt/tuggle/goreman -basedir /opt/tuggle start"
     ports:
      - "<%= 8900+n %>:8900"
+    environment:
+      RATE: "<%= ENV['RATE'] %>"
 <% end %>
