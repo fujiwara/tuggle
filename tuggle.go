@@ -396,7 +396,7 @@ func putHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	r.ParseForm() // parse must do after r.Body is read.
-	if len(r.Form["silent"]) == 0 {
+	if len(r.Form["sync"]) > 0 {
 		ev := &api.UserEvent{
 			Name:    Namespace,
 			Payload: []byte("PUT:" + name),
