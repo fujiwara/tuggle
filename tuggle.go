@@ -142,9 +142,7 @@ func init() {
 	if err != nil {
 		panic(err)
 	}
-}
 
-func init() {
 	rand.Seed(time.Now().UnixNano())
 }
 
