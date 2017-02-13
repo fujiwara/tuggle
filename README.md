@@ -112,8 +112,9 @@ tuggle on node{2,3} works as below.
   - Fetch test.gz from `[MD5 of filename].tuggle.service.consul`
   - Store into data-dir.
   - Register myself to Consul service.
+  - Serve file to http client.
 
-### DELETE files
+### Delete files
 
 ```
 [node1]$ curl -X DELETE localhost:8900/test.gz
