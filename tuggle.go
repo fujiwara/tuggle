@@ -145,15 +145,15 @@ func init() {
 }
 
 func main() {
-	go fileFetcher()
-	go eventWatcher()
-
 	var fetchRate string
 	flag.StringVar(&dataDir, "data-dir", dataDir, "data directory")
 	flag.IntVar(&Port, "port", Port, "listen port")
 	flag.StringVar(&Namespace, "namespace", Namespace, "namespace")
 	flag.StringVar(&fetchRate, "fetch-rate", "unlimited", "Max fetch rate limit(/sec)")
 	flag.Parse()
+
+	go fileFetcher()
+	go eventWatcher()
 
 	if fetchRate != "unlimited" && fetchRate != "" {
 		if rate, err := humanize.ParseBytes(fetchRate); err != nil {
