@@ -110,9 +110,7 @@ func NewGraph(from, to string, start time.Time) *Graph {
 }
 
 func md5Hex(b []byte) string {
-	h := md5.New()
-	h.Write(b)
-	return fmt.Sprintf("%x", h.Sum(nil))
+	return fmt.Sprintf("%x", md5.Sum(b))
 }
 
 func NewObject(name string) *Object {
