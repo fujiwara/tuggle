@@ -34,6 +34,7 @@ var (
 	dataDir           = "./data"
 	Namespace         = "tuggle"
 	Port              = 8900
+	isSlave           = false
 	MaxFetchMultiplex = 3
 	MaxFetchRate      float64
 	MaxFetchRetry     = 10
@@ -66,6 +67,8 @@ digraph "{{.Name}}" {
 const (
 	defaultContentType = "application/octet-stream"
 	InternalHeader     = "X-Tuggle-Internal"
+	MethodFetch        = "FETCH"
+	MethodDelete       = "DELETE"
 )
 
 type Object struct {
@@ -155,6 +158,7 @@ func main() {
 	flag.IntVar(&Port, "port", Port, "listen port")
 	flag.StringVar(&Namespace, "namespace", Namespace, "namespace")
 	flag.StringVar(&fetchRate, "fetch-rate", "unlimited", "Max fetch rate limit(/sec)")
+	flag.BoolVar(&isSlave, "slave", false, "slave mode (fetch only)")
 	flag.Parse()
 
 	if fetchRate != "unlimited" && fetchRate != "" {
@@ -172,12 +176,17 @@ func main() {
 	m.HandleFunc("/{name:[^/]+}", getHandler).Methods("GET", "HEAD")
 	m.HandleFunc("/{name:[^/]+}", deleteHandler).Methods("DELETE")
 
+	slaveMsg := ""
+	if isSlave {
+		slaveMsg = " slave mode"
+	}
 	log.Printf(
-		"starting tuggle data-dir:%s port:%d namespace:%s fetch-rate:%s/sec",
+		"starting tuggle data-dir:%s port:%d namespace:%s fetch-rate:%s/sec%s",
 		dataDir,
 		Port,
 		Namespace,
 		fetchRate,
+		slaveMsg,
 	)
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", Port), m))
 }
@@ -246,7 +255,7 @@ WATCH:
 				// at first time, ignore all stucked events
 				continue EVENT
 			}
-			err := processEvent(string(ev.Payload))
+			err := processEvent(ev.Payload)
 			if err != nil {
 				log.Println(err)
 			}
@@ -255,21 +264,36 @@ WATCH:
 	}
 }
 
-func processEvent(payload string) error {
-	p := strings.SplitN(payload, ":", 2)
+func fetchPayload(name string) []byte {
+	return []byte(MethodFetch + ":" + name)
+}
+
+func deletePayload(name string) []byte {
+	return []byte(MethodDelete + ":" + name)
+}
+
+func parsePayload(payload []byte) (method, name string, err error) {
+	p := strings.SplitN(string(payload), ":", 2)
 	if len(p) != 2 {
-		return fmt.Errorf("invalid payload %s", payload)
+		return "", "", fmt.Errorf("invalid payload %s", string(payload))
 	}
-	method, name := p[0], p[1]
+	return p[0], p[1], nil
+}
+
+func processEvent(payload []byte) error {
+	method, name, err := parsePayload(payload)
+	if err != nil {
+		return err
+	}
 	switch method {
-	case "PUT":
+	case MethodFetch:
 		log.Println("fetching", name)
 		f, err := fetch(name)
 		if err != nil {
 			return err
 		}
 		f.Close()
-	case "DELETE":
+	case MethodDelete:
 		log.Println("deleting", name)
 		obj := NewObject(name)
 		if err := deregisterService(obj); err != nil {
@@ -356,6 +380,11 @@ func storeFile(name string, r io.ReadCloser) (*Object, error) {
 }
 
 func putHandler(w http.ResponseWriter, r *http.Request) {
+	if isSlave {
+		http.Error(w, "slave mode", http.StatusMethodNotAllowed)
+		return
+	}
+
 	vars := mux.Vars(r)
 	name := vars["name"]
 
@@ -397,15 +426,16 @@ func putHandler(w http.ResponseWriter, r *http.Request) {
 
 	r.ParseForm() // parse must do after r.Body is read.
 	if len(r.Form["sync"]) > 0 {
+		p := fetchPayload(name)
 		ev := &api.UserEvent{
 			Name:    Namespace,
-			Payload: []byte("PUT:" + name),
+			Payload: p,
 		}
 		eventID, _, err := client.Event().Fire(ev, nil)
 		if err != nil {
 			log.Println(err)
 		} else {
-			log.Printf("event PUT:%s fired ID:%s", name, eventID)
+			log.Printf("event %s fired ID:%s", string(p), eventID)
 		}
 	}
 
@@ -495,6 +525,10 @@ func fetch(name string) (io.ReadCloser, error) {
 
 func fileFetcher() {
 	for req := range fetcherCh {
+		if isSlave {
+			// waits a little because slave will not become supplier
+			time.Sleep(1 * time.Second)
+		}
 		r, err := loadFileOrRemote(req.Name)
 		req.Ch <- fetchResponse{
 			Reader: r,
@@ -616,8 +650,10 @@ func loadRemoteAndStore(addr, name string) error {
 		elapsed.Seconds(),
 		humanize.Bytes(uint64(float64(obj.Size)/elapsed.Seconds())),
 	)
-	if err := registerService(obj); err != nil {
-		return err
+	if !isSlave {
+		if err := registerService(obj); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -757,15 +793,16 @@ func deleteHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 
+	p := deletePayload(obj.Name)
 	ev := &api.UserEvent{
 		Name:    Namespace,
-		Payload: []byte("DELETE:" + obj.Name),
+		Payload: p,
 	}
 	eventID, _, err := client.Event().Fire(ev, nil)
 	if err != nil {
 		log.Println(err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
-	log.Printf("event DELETE:%s fired ID:%s", obj.Name, eventID)
+	log.Printf("event %s fired ID:%s", string(p), eventID)
 	return
 }
