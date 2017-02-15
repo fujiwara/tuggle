@@ -264,11 +264,11 @@ WATCH:
 	}
 }
 
-func fetchPayload(name string) []byte {
+func newPayloadFetch(name string) []byte {
 	return []byte(MethodFetch + ":" + name)
 }
 
-func deletePayload(name string) []byte {
+func newPayloadDelete(name string) []byte {
 	return []byte(MethodDelete + ":" + name)
 }
 
@@ -426,7 +426,7 @@ func putHandler(w http.ResponseWriter, r *http.Request) {
 
 	r.ParseForm() // parse must do after r.Body is read.
 	if len(r.Form["sync"]) > 0 {
-		p := fetchPayload(name)
+		p := newPayloadFetch(name)
 		ev := &api.UserEvent{
 			Name:    Namespace,
 			Payload: p,
@@ -793,7 +793,7 @@ func deleteHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 
-	p := deletePayload(obj.Name)
+	p := newPayloadDelete(obj.Name)
 	ev := &api.UserEvent{
 		Name:    Namespace,
 		Payload: p,
