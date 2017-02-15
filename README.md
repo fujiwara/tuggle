@@ -18,6 +18,8 @@ Usage of tuggle:
     	namespace (default "tuggle")
   -port int
     	listen port (default 8900)
+  -slave
+    	slave mode (fetch only)
 ```
 
 ## Getting Started
