@@ -89,20 +89,6 @@ type Graph struct {
 	Elapsed time.Duration `json:"elapsed"`
 }
 
-type Graphs []*Graph
-
-func (gs Graphs) Len() int {
-	return len(gs)
-}
-
-func (gs Graphs) Less(i, j int) bool {
-	return gs[i].Start.Before(gs[j].Start)
-}
-
-func (gs Graphs) Swap(i, j int) {
-	gs[i], gs[j] = gs[j], gs[i]
-}
-
 func NewGraph(from, to string, start time.Time) *Graph {
 	now := time.Now()
 	return &Graph{
@@ -751,7 +737,7 @@ func graphHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	gs := make(Graphs, 0, len(kvps))
+	gs := make([]*Graph, 0, len(kvps))
 	for _, kvp := range kvps {
 		var g Graph
 		if err := json.Unmarshal(kvp.Value, &g); err != nil {
@@ -760,7 +746,9 @@ func graphHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		gs = append(gs, &g)
 	}
-	sort.Sort(gs)
+	sort.Slice(gs, func(i, j int) bool {
+		return gs[i].Start.Before(gs[j].Start)
+	})
 	v := struct {
 		Name  string
 		Nodes []*Graph
