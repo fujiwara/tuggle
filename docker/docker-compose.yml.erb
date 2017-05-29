@@ -4,7 +4,7 @@ services:
     image: consul:latest
     volumes:
      - .:/opt/tuggle
-    command: "agent -server -bootstrap-expect 1 -bind 0.0.0.0"
+    command: "agent -server -bootstrap-expect 1 -bind 0.0.0.0 -disable-host-node-id"
     ports:
      - "8500:8500"
 
@@ -19,5 +19,5 @@ services:
     ports:
      - "<%= 8900+n %>:8900"
     environment:
-      RATE: "<%= ENV['RATE'] %>"
+      OPTIONS: "<%= ENV['OPTIONS'] %>"
 <% end %>

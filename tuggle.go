@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/json"
 	"errors"
@@ -34,9 +35,11 @@ var (
 	dataDir           = "./data"
 	Namespace         = "tuggle"
 	Port              = 8900
+	isSlave           = false
 	MaxFetchMultiplex = 3
 	MaxFetchRate      float64
-	MaxFetchRetry     = 10
+	MaxFetchDelay     = 10 * time.Second
+	FetchTimeout      = 600 * time.Second
 	fetcherCh         = make(chan fetchRequest, 10)
 	graphTemplate     = `
 digraph "{{.Name}}" {
@@ -66,6 +69,8 @@ digraph "{{.Name}}" {
 const (
 	defaultContentType = "application/octet-stream"
 	InternalHeader     = "X-Tuggle-Internal"
+	MethodFetch        = "FETCH"
+	MethodDelete       = "DELETE"
 )
 
 type Object struct {
@@ -82,20 +87,6 @@ type Graph struct {
 	Start   time.Time     `json:"start"`
 	End     time.Time     `json:"end"`
 	Elapsed time.Duration `json:"elapsed"`
-}
-
-type Graphs []*Graph
-
-func (gs Graphs) Len() int {
-	return len(gs)
-}
-
-func (gs Graphs) Less(i, j int) bool {
-	return gs[i].Start.Before(gs[j].Start)
-}
-
-func (gs Graphs) Swap(i, j int) {
-	gs[i], gs[j] = gs[j], gs[i]
 }
 
 func NewGraph(from, to string, start time.Time) *Graph {
@@ -145,11 +136,16 @@ func init() {
 }
 
 func main() {
-	var fetchRate string
+	var (
+		fetchRate    string
+		fetchTimeout string
+	)
 	flag.StringVar(&dataDir, "data-dir", dataDir, "data directory")
 	flag.IntVar(&Port, "port", Port, "listen port")
 	flag.StringVar(&Namespace, "namespace", Namespace, "namespace")
 	flag.StringVar(&fetchRate, "fetch-rate", "unlimited", "Max fetch rate limit(/sec)")
+	flag.StringVar(&fetchTimeout, "fetch-timeout", FetchTimeout.String(), "fetch timeout")
+	flag.BoolVar(&isSlave, "slave", false, "slave mode (fetch only)")
 	flag.Parse()
 
 	go fileFetcher()
@@ -163,6 +159,14 @@ func main() {
 			MaxFetchRate = float64(rate)
 		}
 	}
+	if fetchTimeout != "" {
+		d, err := time.ParseDuration(fetchTimeout)
+		if err != nil {
+			fmt.Println("Cannot parse -fetch-timeout", err)
+			os.Exit(1)
+		}
+		FetchTimeout = d
+	}
 
 	m := mux.NewRouter()
 	m.HandleFunc("/", indexHandler).Methods("GET")
@@ -170,12 +174,17 @@ func main() {
 	m.HandleFunc("/{name:[^/]+}", getHandler).Methods("GET", "HEAD")
 	m.HandleFunc("/{name:[^/]+}", deleteHandler).Methods("DELETE")
 
+	slaveMsg := ""
+	if isSlave {
+		slaveMsg = " slave mode"
+	}
 	log.Printf(
-		"starting tuggle data-dir:%s port:%d namespace:%s fetch-rate:%s/sec",
+		"starting tuggle data-dir:%s port:%d namespace:%s fetch-rate:%s/sec%s",
 		dataDir,
 		Port,
 		Namespace,
 		fetchRate,
+		slaveMsg,
 	)
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", Port), m))
 }
@@ -244,7 +253,7 @@ WATCH:
 				// at first time, ignore all stucked events
 				continue EVENT
 			}
-			err := processEvent(string(ev.Payload))
+			err := processEvent(ev.Payload)
 			if err != nil {
 				log.Println(err)
 			}
@@ -253,21 +262,36 @@ WATCH:
 	}
 }
 
-func processEvent(payload string) error {
-	p := strings.SplitN(payload, ":", 2)
+func newPayloadFetch(name string) []byte {
+	return []byte(MethodFetch + ":" + name)
+}
+
+func newPayloadDelete(name string) []byte {
+	return []byte(MethodDelete + ":" + name)
+}
+
+func parsePayload(payload []byte) (method, name string, err error) {
+	p := strings.SplitN(string(payload), ":", 2)
 	if len(p) != 2 {
-		return fmt.Errorf("invalid payload %s", payload)
+		return "", "", fmt.Errorf("invalid payload %s", string(payload))
 	}
-	method, name := p[0], p[1]
+	return p[0], p[1], nil
+}
+
+func processEvent(payload []byte) error {
+	method, name, err := parsePayload(payload)
+	if err != nil {
+		return err
+	}
 	switch method {
-	case "PUT":
+	case MethodFetch:
 		log.Println("fetching", name)
 		f, err := fetch(name)
 		if err != nil {
 			return err
 		}
 		f.Close()
-	case "DELETE":
+	case MethodDelete:
 		log.Println("deleting", name)
 		obj := NewObject(name)
 		if err := deregisterService(obj); err != nil {
@@ -354,6 +378,11 @@ func storeFile(name string, r io.ReadCloser) (*Object, error) {
 }
 
 func putHandler(w http.ResponseWriter, r *http.Request) {
+	if isSlave {
+		http.Error(w, "slave mode", http.StatusMethodNotAllowed)
+		return
+	}
+
 	vars := mux.Vars(r)
 	name := vars["name"]
 
@@ -395,15 +424,16 @@ func putHandler(w http.ResponseWriter, r *http.Request) {
 
 	r.ParseForm() // parse must do after r.Body is read.
 	if len(r.Form["sync"]) > 0 {
+		p := newPayloadFetch(name)
 		ev := &api.UserEvent{
 			Name:    Namespace,
-			Payload: []byte("PUT:" + name),
+			Payload: p,
 		}
 		eventID, _, err := client.Event().Fire(ev, nil)
 		if err != nil {
 			log.Println(err)
 		} else {
-			log.Printf("event PUT:%s fired ID:%s", name, eventID)
+			log.Printf("event %s fired ID:%s", string(p), eventID)
 		}
 	}
 
@@ -493,6 +523,10 @@ func fetch(name string) (io.ReadCloser, error) {
 
 func fileFetcher() {
 	for req := range fetcherCh {
+		if isSlave {
+			// waits a little because slave will not become supplier
+			time.Sleep(1 * time.Second)
+		}
 		r, err := loadFileOrRemote(req.Name)
 		req.Ch <- fetchResponse{
 			Reader: r,
@@ -508,7 +542,11 @@ func loadFileOrRemote(name string) (io.ReadCloser, error) {
 		return f, nil
 	}
 
-	for i := 0; i < MaxFetchRetry; i++ {
+	ctx, cancel := context.WithTimeout(context.Background(), FetchTimeout)
+	defer cancel()
+	i := 0
+	for {
+		i++
 		// lookup service catlog
 		catalogServices, _, err := client.Catalog().Service(
 			Namespace,            // service name
@@ -536,7 +574,16 @@ func loadFileOrRemote(name string) (io.ReadCloser, error) {
 
 		sem, err := lockFetchMultiplex(cs.Address)
 		if err != nil || sem == nil {
-			delay := time.Duration(i+1) * time.Second
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("timed out")
+			default:
+			}
+			d := float64(i) + rand.ExpFloat64()
+			delay, _ := time.ParseDuration(fmt.Sprintf("%0.9fs", d))
+			if delay > MaxFetchDelay {
+				delay = MaxFetchDelay
+			}
 			log.Printf(
 				"failed to get semaphore for %s waiting %s",
 				cs.Address,
@@ -547,12 +594,18 @@ func loadFileOrRemote(name string) (io.ReadCloser, error) {
 		}
 		start := time.Now()
 		err = loadRemoteAndStore(
+			ctx,
 			fmt.Sprintf("%s:%d", cs.Address, cs.ServicePort),
 			name,
 		)
 		sem.Release()
 		if err != nil {
 			log.Println(err)
+			select {
+			case <-ctx.Done():
+				return nil, errors.New("fetch timed out")
+			default:
+			}
 			continue
 		}
 		self, _ := client.Agent().NodeName()
@@ -585,15 +638,14 @@ func NewLimitedReader(src io.ReadCloser, limit float64) *LimitedReader {
 	return &LimitedReader{reader, src}
 }
 
-func loadRemoteAndStore(addr, name string) error {
+func loadRemoteAndStore(ctx context.Context, addr, name string) error {
 	u := fmt.Sprintf("http://%s/%s", addr, name)
 	log.Printf("loading remote %s", u)
 	req, _ := http.NewRequest("GET", u, nil)
 	req.Header.Set(InternalHeader, "True")
 
 	start := time.Now()
-
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := http.DefaultClient.Do(req.WithContext(ctx))
 	if err != nil {
 		return err
 	}
@@ -614,8 +666,10 @@ func loadRemoteAndStore(addr, name string) error {
 		elapsed.Seconds(),
 		humanize.Bytes(uint64(float64(obj.Size)/elapsed.Seconds())),
 	)
-	if err := registerService(obj); err != nil {
-		return err
+	if !isSlave {
+		if err := registerService(obj); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -681,7 +735,7 @@ func graphHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	gs := make(Graphs, 0, len(kvps))
+	gs := make([]*Graph, 0, len(kvps))
 	for _, kvp := range kvps {
 		var g Graph
 		if err := json.Unmarshal(kvp.Value, &g); err != nil {
@@ -690,7 +744,9 @@ func graphHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		gs = append(gs, &g)
 	}
-	sort.Sort(gs)
+	sort.Slice(gs, func(i, j int) bool {
+		return gs[i].Start.Before(gs[j].Start)
+	})
 	v := struct {
 		Name  string
 		Nodes []*Graph
@@ -755,15 +811,16 @@ func deleteHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 
+	p := newPayloadDelete(obj.Name)
 	ev := &api.UserEvent{
 		Name:    Namespace,
-		Payload: []byte("DELETE:" + obj.Name),
+		Payload: p,
 	}
 	eventID, _, err := client.Event().Fire(ev, nil)
 	if err != nil {
 		log.Println(err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
-	log.Printf("event DELETE:%s fired ID:%s", obj.Name, eventID)
+	log.Printf("event %s fired ID:%s", string(p), eventID)
 	return
 }

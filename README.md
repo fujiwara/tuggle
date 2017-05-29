@@ -14,10 +14,14 @@ Usage of tuggle:
     	data directory (default "./data")
   -fetch-rate string
     	Max fetch rate limit(/sec) (default "unlimited")
+  -fetch-timeout string
+    	fetch timeout (default "10m0s")
   -namespace string
     	namespace (default "tuggle")
   -port int
     	listen port (default 8900)
+  -slave
+    	slave mode (fetch only)
 ```
 
 ## Getting Started

@@ -1,2 +1,2 @@
-consul: consul agent -data-dir /var/tmp/consul -client 0.0.0.0 -join server
-tuggle: sh -c "exec /opt/tuggle/tuggle -data-dir /tmp -fetch-rate '$RATE'"
+consul: consul agent -data-dir /var/tmp/consul -client 0.0.0.0 -retry-join server -disable-host-node-id
+tuggle: sh -c "exec /opt/tuggle/tuggle -data-dir /tmp $OPTIONS"
