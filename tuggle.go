@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/json"
 	"errors"
@@ -37,7 +38,8 @@ var (
 	isSlave           = false
 	MaxFetchMultiplex = 3
 	MaxFetchRate      float64
-	MaxFetchRetry     = 10
+	MaxFetchDelay     = 10 * time.Second
+	FetchTimeout      = 600 * time.Second
 	fetcherCh         = make(chan fetchRequest, 10)
 	graphTemplate     = `
 digraph "{{.Name}}" {
@@ -85,20 +87,6 @@ type Graph struct {
 	Start   time.Time     `json:"start"`
 	End     time.Time     `json:"end"`
 	Elapsed time.Duration `json:"elapsed"`
-}
-
-type Graphs []*Graph
-
-func (gs Graphs) Len() int {
-	return len(gs)
-}
-
-func (gs Graphs) Less(i, j int) bool {
-	return gs[i].Start.Before(gs[j].Start)
-}
-
-func (gs Graphs) Swap(i, j int) {
-	gs[i], gs[j] = gs[j], gs[i]
 }
 
 func NewGraph(from, to string, start time.Time) *Graph {
@@ -153,11 +141,15 @@ func main() {
 	go fileFetcher()
 	go eventWatcher()
 
-	var fetchRate string
+	var (
+		fetchRate    string
+		fetchTimeout string
+	)
 	flag.StringVar(&dataDir, "data-dir", dataDir, "data directory")
 	flag.IntVar(&Port, "port", Port, "listen port")
 	flag.StringVar(&Namespace, "namespace", Namespace, "namespace")
 	flag.StringVar(&fetchRate, "fetch-rate", "unlimited", "Max fetch rate limit(/sec)")
+	flag.StringVar(&fetchTimeout, "fetch-timeout", FetchTimeout.String(), "fetch timeout")
 	flag.BoolVar(&isSlave, "slave", false, "slave mode (fetch only)")
 	flag.Parse()
 
@@ -168,6 +160,14 @@ func main() {
 		} else {
 			MaxFetchRate = float64(rate)
 		}
+	}
+	if fetchTimeout != "" {
+		d, err := time.ParseDuration(fetchTimeout)
+		if err != nil {
+			fmt.Println("Cannot parse -fetch-timeout", err)
+			os.Exit(1)
+		}
+		FetchTimeout = d
 	}
 
 	m := mux.NewRouter()
@@ -544,7 +544,11 @@ func loadFileOrRemote(name string) (io.ReadCloser, error) {
 		return f, nil
 	}
 
-	for i := 0; i < MaxFetchRetry; i++ {
+	ctx, cancel := context.WithTimeout(context.Background(), FetchTimeout)
+	defer cancel()
+	i := 0
+	for {
+		i++
 		// lookup service catlog
 		catalogServices, _, err := client.Catalog().Service(
 			Namespace,            // service name
@@ -572,7 +576,16 @@ func loadFileOrRemote(name string) (io.ReadCloser, error) {
 
 		sem, err := lockFetchMultiplex(cs.Address)
 		if err != nil || sem == nil {
-			delay := time.Duration(i+1) * time.Second
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("timed out")
+			default:
+			}
+			d := float64(i) + rand.ExpFloat64()
+			delay, _ := time.ParseDuration(fmt.Sprintf("%0.9fs", d))
+			if delay > MaxFetchDelay {
+				delay = MaxFetchDelay
+			}
 			log.Printf(
 				"failed to get semaphore for %s waiting %s",
 				cs.Address,
@@ -583,12 +596,18 @@ func loadFileOrRemote(name string) (io.ReadCloser, error) {
 		}
 		start := time.Now()
 		err = loadRemoteAndStore(
+			ctx,
 			fmt.Sprintf("%s:%d", cs.Address, cs.ServicePort),
 			name,
 		)
 		sem.Release()
 		if err != nil {
 			log.Println(err)
+			select {
+			case <-ctx.Done():
+				return nil, errors.New("fetch timed out")
+			default:
+			}
 			continue
 		}
 		self, _ := client.Agent().NodeName()
@@ -621,15 +640,14 @@ func NewLimitedReader(src io.ReadCloser, limit float64) *LimitedReader {
 	return &LimitedReader{reader, src}
 }
 
-func loadRemoteAndStore(addr, name string) error {
+func loadRemoteAndStore(ctx context.Context, addr, name string) error {
 	u := fmt.Sprintf("http://%s/%s", addr, name)
 	log.Printf("loading remote %s", u)
 	req, _ := http.NewRequest("GET", u, nil)
 	req.Header.Set(InternalHeader, "True")
 
 	start := time.Now()
-
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := http.DefaultClient.Do(req.WithContext(ctx))
 	if err != nil {
 		return err
 	}
@@ -719,7 +737,7 @@ func graphHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	gs := make(Graphs, 0, len(kvps))
+	gs := make([]*Graph, 0, len(kvps))
 	for _, kvp := range kvps {
 		var g Graph
 		if err := json.Unmarshal(kvp.Value, &g); err != nil {
@@ -728,7 +746,9 @@ func graphHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		gs = append(gs, &g)
 	}
-	sort.Sort(gs)
+	sort.Slice(gs, func(i, j int) bool {
+		return gs[i].Start.Before(gs[j].Start)
+	})
 	v := struct {
 		Name  string
 		Nodes []*Graph
