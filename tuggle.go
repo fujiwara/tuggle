@@ -101,9 +101,7 @@ func NewGraph(from, to string, start time.Time) *Graph {
 }
 
 func md5Hex(b []byte) string {
-	h := md5.New()
-	h.Write(b)
-	return fmt.Sprintf("%x", h.Sum(nil))
+	return fmt.Sprintf("%x", md5.Sum(b))
 }
 
 func NewObject(name string) *Object {
@@ -138,9 +136,6 @@ func init() {
 }
 
 func main() {
-	go fileFetcher()
-	go eventWatcher()
-
 	var (
 		fetchRate    string
 		fetchTimeout string
@@ -152,6 +147,9 @@ func main() {
 	flag.StringVar(&fetchTimeout, "fetch-timeout", FetchTimeout.String(), "fetch timeout")
 	flag.BoolVar(&isSlave, "slave", false, "slave mode (fetch only)")
 	flag.Parse()
+
+	go fileFetcher()
+	go eventWatcher()
 
 	if fetchRate != "unlimited" && fetchRate != "" {
 		if rate, err := humanize.ParseBytes(fetchRate); err != nil {
