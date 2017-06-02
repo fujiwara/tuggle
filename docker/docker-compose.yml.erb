@@ -7,6 +7,7 @@ services:
     command: "agent -server -bootstrap-expect 1 -bind 0.0.0.0 -disable-host-node-id"
     ports:
      - "8500:8500"
+    hostname: server
 
 <% ENV['CLIENTS'].to_i.times do|n| %>    
   client<%= n %>:
@@ -20,4 +21,5 @@ services:
      - "<%= 8900+n %>:8900"
     environment:
       OPTIONS: "<%= ENV['OPTIONS'] %>"
+    hostname: client<%= n %>
 <% end %>
