@@ -727,6 +727,8 @@ func getHandler(w http.ResponseWriter, r *http.Request) {
 	f, err := action(name)
 	if err != nil {
 		log.Println(err)
+		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Del("Content-Length")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
