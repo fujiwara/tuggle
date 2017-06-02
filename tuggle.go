@@ -41,6 +41,7 @@ var (
 	MaxFetchDelay     = 10 * time.Second
 	FetchTimeout      = 600 * time.Second
 	fetcherCh         = make(chan fetchRequest, 10)
+	CheckInterval     = time.Second * 10
 	graphTemplate     = `
 digraph "{{.Name}}" {
   graph [
@@ -214,6 +215,10 @@ func manageService(obj *Object, register bool) error {
 		Name: Namespace,
 		Tags: tags,
 		Port: Port,
+		Check: &api.AgentServiceCheck{
+			Interval: CheckInterval.String(),
+			HTTP:     fmt.Sprintf("http://localhost:%d/?ping", Port),
+		},
 	}
 	return client.Agent().ServiceRegister(reg)
 }
@@ -461,6 +466,11 @@ func lockFetchMultiplex(key string) (*api.Semaphore, error) {
 }
 
 func indexHandler(w http.ResponseWriter, r *http.Request) {
+	r.ParseForm()
+	if len(r.Form["ping"]) > 0 {
+		return
+	}
+
 	kv := client.KV()
 	kvps, _, err := kv.List(Namespace+"/", nil)
 	if err != nil {
@@ -548,9 +558,10 @@ func loadFileOrRemote(name string) (io.ReadCloser, error) {
 	for {
 		i++
 		// lookup service catlog
-		catalogServices, _, err := client.Catalog().Service(
+		serviceEntry, _, err := client.Health().Service(
 			Namespace,            // service name
 			md5Hex([]byte(name)), // tag is Object.ID
+			true,                 // passing only
 			&api.QueryOptions{
 				RequireConsistent: true,
 				Near:              "_agent",
@@ -560,7 +571,7 @@ func loadFileOrRemote(name string) (io.ReadCloser, error) {
 			log.Println(err)
 			continue
 		}
-		nodes := len(catalogServices)
+		nodes := len(serviceEntry)
 		if nodes == 0 {
 			return nil, errors.New("Not Found in this cluster")
 		}
@@ -570,9 +581,10 @@ func loadFileOrRemote(name string) (io.ReadCloser, error) {
 		if nodes < n {
 			n = nodes
 		}
-		cs := catalogServices[rand.Intn(n)]
+		se := serviceEntry[rand.Intn(n)]
+		nodeName, nodeAddr, servicePort := se.Node.Node, se.Node.Address, se.Service.Port
 
-		sem, err := lockFetchMultiplex(cs.Address)
+		sem, err := lockFetchMultiplex(nodeAddr)
 		if err != nil || sem == nil {
 			select {
 			case <-ctx.Done():
@@ -586,7 +598,7 @@ func loadFileOrRemote(name string) (io.ReadCloser, error) {
 			}
 			log.Printf(
 				"failed to get semaphore for %s waiting %s",
-				cs.Address,
+				nodeAddr,
 				delay,
 			)
 			time.Sleep(delay)
@@ -595,7 +607,7 @@ func loadFileOrRemote(name string) (io.ReadCloser, error) {
 		start := time.Now()
 		err = loadRemoteAndStore(
 			ctx,
-			fmt.Sprintf("%s:%d", cs.Address, cs.ServicePort),
+			fmt.Sprintf("%s:%d", nodeAddr, servicePort),
 			name,
 		)
 		sem.Release()
@@ -611,7 +623,7 @@ func loadFileOrRemote(name string) (io.ReadCloser, error) {
 		self, _ := client.Agent().NodeName()
 		err = recordGraph(
 			name,
-			NewGraph(cs.Node, self, start),
+			NewGraph(nodeName, self, start),
 		)
 		if err != nil {
 			log.Println(err)
